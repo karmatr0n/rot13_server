@@ -13,14 +13,17 @@ puts "%-8s %-25s %-8s %-6s %-8s %-6s %s" % %w(SntMsg StartsAt ConnId Delay RcvMs
 conn_num.to_i.times.map do |n|
   Thread.new do
     st = Time.now.strftime("%F %T.%L")
-    socket= TCPSocket.open host, port
-    msg = "Moo{n}"
-    socket.puts msg
     dsec = rand(5)
+    msg = "Moo#{n}"
+
+    socket= TCPSocket.open host, port
+    socket.puts msg
     sleep(dsec)
     rsp = socket.readline.chomp
+
     et = Time.now.strftime("%F %T.%L")
     counter += 1
+
     puts "%-8s %-25s %-8s %-6s %-8s %-6s %s" % [msg, st, n, dsec, rsp, counter, et]
   end
 end.each(&:join)
