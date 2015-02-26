@@ -11,3 +11,7 @@ obfuscation of line each as it arrives.
   $ ./rot13_server &
   $ telnet localhost 40713
 
+    or
+
+  $ ruby rot13_client.rb 25
+
