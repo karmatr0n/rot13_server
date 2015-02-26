@@ -10,8 +10,8 @@
 #include <sys/socket.h>
 /* For fcntl */
 #include <fcntl.h>
-/* For select */
-#include <sys/select.h>
+/* For event */
+#include <event2/event.h>
 
 #include <assert.h>
 #include <unistd.h>
@@ -21,6 +21,9 @@
 #include <errno.h>
 
 #define MAX_LINE 16384
+
+void do_read(evutil_socket_t fd, short events, void *arg);
+void do_write(evutil_socket_t fd, short events, void *arg);
 
 char
 rot13_char(char c)
@@ -37,41 +40,56 @@ struct fd_state {
   char buffer[MAX_LINE];
   size_t buffer_used;
 
-  int writing;
   size_t n_written;
   size_t write_upto;
+
+  struct event *read_event;
+  struct event *write_event;
 };
 
 struct fd_state *
-alloc_fd_state(void)
+alloc_fd_state(struct event_base *base, evutil_socket_t fd)
 {
   struct fd_state *state = malloc(sizeof(struct fd_state));
   if (!state)
     return NULL;
-  state->buffer_used = state->n_written = state->writing =
-    state->write_upto = 0;
+  state->read_event = event_new(base, fd, EV_READ|EV_PERSIST, do_read, state);
+  if (!state->read_event) {
+    free(state);
+    return NULL;
+  }
+  state->write_event =
+    event_new(base, fd, EV_WRITE|EV_PERSIST, do_write, state);
+
+  if (!state->write_event) {
+    event_free(state->read_event);
+    free(state);
+    return NULL;
+  }
+
+  state->buffer_used = state->n_written = state->write_upto = 0;
+
+  assert(state->write_event);
   return state;
 }
 
 void
 free_fd_state(struct fd_state *state)
 {
+  event_free(state->read_event);
+  event_free(state->write_event);
   free(state);
 }
 
 void
-make_nonblocking(int fd)
+do_read(evutil_socket_t fd, short events, void *arg)
 {
-  fcntl(fd, F_SETFL, O_NONBLOCK);
-}
-
-int
-do_read(int fd, struct fd_state *state)
-{
+  struct fd_state *state = arg;
   char buf[1024];
   int i;
   ssize_t result;
   while (1) {
+    assert(state->write_event);
     result = recv(fd, buf, sizeof(buf), 0);
     if (result <= 0)
       break;
@@ -80,33 +98,36 @@ do_read(int fd, struct fd_state *state)
       if (state->buffer_used < sizeof(state->buffer))
         state->buffer[state->buffer_used++] = rot13_char(buf[i]);
       if (buf[i] == '\n') {
-        state->writing = 1;
+        assert(state->write_event);
+        event_add(state->write_event, NULL);
         state->write_upto = state->buffer_used;
       }
     }
   }
 
   if (result == 0) {
-    return 1;
+    free_fd_state(state);
   } else if (result < 0) {
-    if (errno == EAGAIN)
-      return 0;
-    return -1;
+    if (errno == EAGAIN) // XXXX use evutil macro
+      return;
+    perror("recv");
+    free_fd_state(state);
   }
-
-  return 0;
 }
 
-int
-do_write(int fd, struct fd_state *state)
+void
+do_write(evutil_socket_t fd, short events, void *arg)
 {
+  struct fd_state *state = arg;
+
   while (state->n_written < state->write_upto) {
     ssize_t result = send(fd, state->buffer + state->n_written,
         state->write_upto - state->n_written, 0);
     if (result < 0) {
-      if (errno == EAGAIN)
-        return 0;
-      return -1;
+      if (errno == EAGAIN) // XXX use evutil macro
+        return;
+      free_fd_state(state);
+      return;
     }
     assert(result != 0);
 
@@ -114,31 +135,50 @@ do_write(int fd, struct fd_state *state)
   }
 
   if (state->n_written == state->buffer_used)
-    state->n_written = state->write_upto = state->buffer_used = 0;
+    state->n_written = state->write_upto = state->buffer_used = 1;
 
-  state->writing = 0;
+  event_del(state->write_event);
+}
 
-  return 0;
+void
+do_accept(evutil_socket_t listener, short event, void *arg)
+{
+  struct event_base *base = arg;
+  struct sockaddr_storage ss;
+  socklen_t slen = sizeof(ss);
+  int fd = accept(listener, (struct sockaddr*)&ss, &slen);
+  if (fd < 0) { // XXXX eagain??
+    perror("accept");
+  } else if (fd > FD_SETSIZE) {
+    close(fd); // XXX replace all closes with EVUTIL_CLOSESOCKET */
+  } else {
+    struct fd_state *state;
+    evutil_make_socket_nonblocking(fd);
+    state = alloc_fd_state(base, fd);
+    assert(state); /*XXX err*/
+    assert(state->write_event);
+    event_add(state->read_event, NULL);
+  }
 }
 
 void
 run(void)
 {
-  int listener;
-  struct fd_state *state[FD_SETSIZE];
+  evutil_socket_t listener;
   struct sockaddr_in sin;
-  int i, maxfd;
-  fd_set readset, writeset, exset;
+  struct event_base *base;
+  struct event *listener_event;
+
+  base = event_base_new();
+  if (!base)
+    return; /*XXXerr*/
 
   sin.sin_family = AF_INET;
   sin.sin_addr.s_addr = 0;
   sin.sin_port = htons(40713);
 
-  for (i = 0; i < FD_SETSIZE; ++i)
-    state[i] = NULL;
-
   listener = socket(AF_INET, SOCK_STREAM, 0);
-  make_nonblocking(listener);
+  evutil_make_socket_nonblocking(listener);
 
 #ifndef WIN32
   {
@@ -157,73 +197,18 @@ run(void)
     return;
   }
 
-  FD_ZERO(&readset);
-  FD_ZERO(&writeset);
-  FD_ZERO(&exset);
+  listener_event = event_new(base, listener, EV_READ|EV_PERSIST, do_accept, (void*)base);
+  /*XXX check it */
+  event_add(listener_event, NULL);
 
-  while (1) {
-    maxfd = listener;
-
-    FD_ZERO(&readset);
-    FD_ZERO(&writeset);
-    FD_ZERO(&exset);
-
-    FD_SET(listener, &readset);
-
-    for (i=0; i < FD_SETSIZE; ++i) {
-      if (state[i]) {
-        if (i > maxfd)
-          maxfd = i;
-        FD_SET(i, &readset);
-        if (state[i]->writing) {
-          FD_SET(i, &writeset);
-        }
-      }
-    }
-
-    if (select(maxfd+1, &readset, &writeset, &exset, NULL) < 0) {
-      perror("select");
-      return;
-    }
-
-    if (FD_ISSET(listener, &readset)) {
-      struct sockaddr_storage ss;
-      socklen_t slen = sizeof(ss);
-      int fd = accept(listener, (struct sockaddr*)&ss, &slen);
-      if (fd < 0) {
-        perror("accept");
-      } else if (fd > FD_SETSIZE) {
-        close(fd);
-      } else {
-        make_nonblocking(fd);
-        state[fd] = alloc_fd_state();
-        assert(state[fd]);/*XXX*/
-      }
-    }
-
-    for (i=0; i < maxfd+1; ++i) {
-      int r = 0;
-      if (i == listener)
-        continue;
-
-      if (FD_ISSET(i, &readset)) {
-        r = do_read(i, state[i]);
-      }
-      if (r == 0 && FD_ISSET(i, &writeset)) {
-        r = do_write(i, state[i]);
-      }
-      if (r) {
-        free_fd_state(state[i]);
-        state[i] = NULL;
-        close(i);
-      }
-    }
-  }
+  event_base_dispatch(base);
 }
 
 int
 main(int c, char **v)
 {
+  setvbuf(stdout, NULL, _IONBF, 0);
+
   run();
   return 0;
 }

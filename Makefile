@@ -1,7 +1,7 @@
 PROGRAM  := rot13_server
 SRC      := rot13_server.c
 CC       := clang
-CFLAGS   := -O3
+CFLAGS   := -O3 -levent
 
 all: clean build
 
