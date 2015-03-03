@@ -12,6 +12,8 @@
 #include <fcntl.h>
 /* For event */
 #include <event2/event.h>
+#include <event2/buffer.h>
+#include <event2/bufferevent.h>
 
 #include <assert.h>
 #include <unistd.h>
@@ -30,114 +32,53 @@ rot13_char(char c)
 {
   if ((c >= 'a' && c <= 'm') || (c >='A' && c <= 'M'))
     return c + 13;
-  else if ((c >= 'n' && c <= 'z') || (c >='N' && c <= 'z')) 
+  else if ((c >= 'n' && c <= 'z') || (c >='N' && c <= 'z'))
     return c - 13;
   else
     return c;
 }
 
-struct fd_state {
-  char buffer[MAX_LINE];
-  size_t buffer_used;
-
-  size_t n_written;
-  size_t write_upto;
-
-  struct event *read_event;
-  struct event *write_event;
-};
-
-struct fd_state *
-alloc_fd_state(struct event_base *base, evutil_socket_t fd)
-{
-  struct fd_state *state = malloc(sizeof(struct fd_state));
-  if (!state)
-    return NULL;
-  state->read_event = event_new(base, fd, EV_READ|EV_PERSIST, do_read, state);
-  if (!state->read_event) {
-    free(state);
-    return NULL;
-  }
-  state->write_event =
-    event_new(base, fd, EV_WRITE|EV_PERSIST, do_write, state);
-
-  if (!state->write_event) {
-    event_free(state->read_event);
-    free(state);
-    return NULL;
-  }
-
-  state->buffer_used = state->n_written = state->write_upto = 0;
-
-  assert(state->write_event);
-  return state;
-}
-
 void
-free_fd_state(struct fd_state *state)
+readcb(struct bufferevent *bev, void *ctx)
 {
-  event_free(state->read_event);
-  event_free(state->write_event);
-  free(state);
-}
-
-void
-do_read(evutil_socket_t fd, short events, void *arg)
-{
-  struct fd_state *state = arg;
-  char buf[1024];
+  struct evbuffer *input, *output;
+  char *line;
+  size_t n;
   int i;
-  ssize_t result;
-  while (1) {
-    assert(state->write_event);
-    result = recv(fd, buf, sizeof(buf), 0);
-    if (result <= 0)
-      break;
+  input = bufferevent_get_input(bev);
+  output = bufferevent_get_output(bev);
 
-    for (i=0; i < result; ++i)  {
-      if (state->buffer_used < sizeof(state->buffer))
-        state->buffer[state->buffer_used++] = rot13_char(buf[i]);
-      if (buf[i] == '\n') {
-        assert(state->write_event);
-        event_add(state->write_event, NULL);
-        state->write_upto = state->buffer_used;
-      }
-    }
+  while ((line = evbuffer_readln(input, &n, EVBUFFER_EOL_LF))) {
+    for (i = 0; i < n; ++i)
+      line[i] = rot13_char(line[i]);
+    evbuffer_add(output, line, n);
+    evbuffer_add(output, "\n", 1);
+    free(line);
   }
 
-  if (result == 0) {
-    free_fd_state(state);
-  } else if (result < 0) {
-    if (errno == EAGAIN) // XXXX use evutil macro
-      return;
-    perror("recv");
-    free_fd_state(state);
+  if (evbuffer_get_length(input) >= MAX_LINE) {
+    char buf[1024];
+    while (evbuffer_get_length(input)) {
+      int n = evbuffer_remove(input, buf, sizeof(buf));
+      for (i = 0; i < n; ++i)
+        buf[i] = rot13_char(buf[i]);
+      evbuffer_add(output, buf, n);
+    }
+    evbuffer_add(output, "\n", 1);
   }
 }
 
 void
-do_write(evutil_socket_t fd, short events, void *arg)
+errorcb(struct bufferevent *bev, short error, void *ctx)
 {
-  struct fd_state *state = arg;
-
-  while (state->n_written < state->write_upto) {
-    ssize_t result = send(fd, state->buffer + state->n_written,
-        state->write_upto - state->n_written, 0);
-    if (result < 0) {
-      if (errno == EAGAIN) // XXX use evutil macro
-        return;
-      free_fd_state(state);
-      return;
-    }
-    assert(result != 0);
-
-    state->n_written += result;
+  if (error & BEV_EVENT_EOF) {
+    printf("Client successfully disconnected.\n");
+  } else if (error & BEV_EVENT_ERROR) {
+    printf("A connection error was here.\n");
+  } else if (error & BEV_EVENT_TIMEOUT) {
+    printf("A connection timeout happened.\n");
   }
-
-  if (state->n_written == state->buffer_used)
-    state->n_written = state->write_upto = state->buffer_used = 1;
-
-  event_del(state->write_event);
+  bufferevent_free(bev);
 }
 
 void
@@ -147,17 +88,18 @@ do_accept(evutil_socket_t listener, short event, void *arg)
   struct sockaddr_storage ss;
   socklen_t slen = sizeof(ss);
   int fd = accept(listener, (struct sockaddr*)&ss, &slen);
-  if (fd < 0) { // XXXX eagain??
+
+  if (fd < 0) {
     perror("accept");
   } else if (fd > FD_SETSIZE) {
-    close(fd); // XXX replace all closes with EVUTIL_CLOSESOCKET */
+    close(fd);
   } else {
-    struct fd_state *state;
+    struct bufferevent *bev;
     evutil_make_socket_nonblocking(fd);
-    state = alloc_fd_state(base, fd);
-    assert(state); /*XXX err*/
-    assert(state->write_event);
-    event_add(state->read_event, NULL);
+    bev = bufferevent_socket_new(base, fd, BEV_OPT_CLOSE_ON_FREE);
+    bufferevent_setcb(bev, readcb, NULL, errorcb, NULL);
+    bufferevent_setwatermark(bev, EV_READ, 0, MAX_LINE);
+    bufferevent_enable(bev, EV_READ|EV_WRITE);
   }
 }
 

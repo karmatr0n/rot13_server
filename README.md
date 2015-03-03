@@ -13,5 +13,5 @@ obfuscation of line each as it arrives.
 
       or
 
-  $ ruby rot13_client.rb 140
+  $ ruby rot13_client.rb 110
 
